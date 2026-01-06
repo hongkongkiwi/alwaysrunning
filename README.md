@@ -39,6 +39,8 @@ Binary path: `target/release/runner`
 ./target/release/runner status --json
 ./target/release/runner logs myapp --follow
 ./target/release/runner logs myapp --lines 500
+./target/release/runner logs myapp --since 10m
+./target/release/runner logs myapp --json
 ./target/release/runner stop myapp
 ./target/release/runner start myapp
 ./target/release/runner restart myapp
@@ -46,7 +48,7 @@ Binary path: `target/release/runner`
 ```
 
 Notes:
-- `stop` stops processes but keeps the app registered.
+- `stop` pauses processes but keeps the app registered (use `start` to resume).
 - `delete` removes the app configuration entirely.
 
 ## Environment variables
@@ -81,7 +83,8 @@ Attach to a running instance from another terminal:
 ./target/release/runner attach
 ```
 
-Watch screen controls: `q`/Ctrl+C to quit, `r` to restart, `s` to stop.
+Watch screen controls: `q`/Ctrl+C to quit, `r` to restart, `s` to stop,
+`j`/`k` to select app, `[`/`]` to select instance, `l` to toggle log tail.
 
 ## Export / import config
 
@@ -120,6 +123,10 @@ Each instance writes to:
 ```
 ~/.alwaysrunning/apps/<app>/logs/instance-<n>.log
 ```
+
+Filters:
+- `--since` accepts Unix seconds or a duration like `10m`, `2h`, `1d` (coarse; uses file mtime).
+- `--json` prints JSON lines: `{"line":"..."}`.
 
 ## Status
 

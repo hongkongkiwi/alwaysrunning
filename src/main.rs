@@ -5,7 +5,7 @@ use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
 use crossterm::terminal::{disable_raw_mode, enable_raw_mode};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, File, OpenOptions};
-use std::io::{Read, Seek, SeekFrom, Write};
+use std::io::{Read, Seek, SeekFrom, Write, IsTerminal};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::thread;
@@ -106,6 +106,12 @@ enum Commands {
         /// Number of lines to show (ignored with --follow).
         #[arg(long, default_value_t = 200)]
         lines: usize,
+        /// Show logs since a timestamp or duration (e.g. 1700000000, 10m, 2h).
+        #[arg(long)]
+        since: Option<String>,
+        /// Output logs as JSON lines.
+        #[arg(long)]
+        json: bool,
     },
     /// Export app config to a file.
     Export {
@@ -165,6 +171,8 @@ struct AppConfig {
     env_file: Option<String>,
     #[serde(default)]
     clean_env: bool,
+    #[serde(default)]
+    paused: bool,
 }
 
 #[derive(Debug, Serialize, Deserialize, Default)]
@@ -256,7 +264,9 @@ fn main() -> Result<()> {
             instance,
             follow,
             lines,
-        } => cmd_logs(&name, instance, follow, lines),
+            since,
+            json,
+        } => cmd_logs(&name, instance, follow, lines, since.as_deref(), json),
         Commands::Export { file, name } => cmd_export(&file, name.as_deref()),
         Commands::Import { file, replace, start } => cmd_import(&file, replace, start),
         Commands::Attach { name } => cmd_status(name.as_deref(), true, false),
@@ -303,6 +313,7 @@ fn cmd_run(
         created_at: now_ts(),
         env_file,
         clean_env,
+        paused: false,
     });
     write_state(&state)?;
     if !no_autostart {
@@ -359,12 +370,14 @@ fn cmd_status(name: Option<&str>, watch: bool, json: bool) -> Result<()> {
         return Ok(());
     }
     for app in snapshot.apps {
+        let paused = if app.paused { "paused " } else { "" };
         println!(
-            "{}: {}/{} running  restarts={}  cmd: {} {}",
+            "{}: {}/{} running  restarts={}  {}cmd: {} {}",
             app.name,
             app.running,
             app.instances_desired,
             app.total_restarts,
+            paused,
             app.cmd,
             app.args.join(" ")
         );
@@ -408,6 +421,7 @@ fn cmd_start(name: &str, instances: Option<usize>) -> Result<()> {
                 }
                 app.instances = i;
             }
+            app.paused = false;
             break;
         }
     }
@@ -423,23 +437,22 @@ fn cmd_start(name: &str, instances: Option<usize>) -> Result<()> {
 fn cmd_stop(name: Option<&str>, all: bool, signal: &str) -> Result<()> {
     ensure_dirs()?;
     let sig = parse_signal(signal)?;
+    let mut state = read_state()?;
     let mut runtime = read_runtime()?;
-    let now = now_ts();
 
     if all {
+        for app in state.apps.iter_mut() {
+            app.paused = true;
+        }
         for (app_name, rt) in runtime.apps.iter_mut() {
             for inst in rt.instances.values_mut() {
                 if inst.pid > 0 {
-                    terminate_pid_with_signal(inst.pid, sig);
-                    inst.pid = 0;
-                    inst.last_exit_at = Some(now);
-                    inst.last_exit_signal = Some(sig);
-                    inst.last_exit_code = None;
+                    terminate_graceful(inst.pid, sig, Duration::from_secs(3));
                 }
             }
             println!("Stopped {}", app_name);
         }
-        write_runtime(&runtime)?;
+        write_state(&state)?;
         return Ok(());
     }
 
@@ -447,26 +460,61 @@ fn cmd_stop(name: Option<&str>, all: bool, signal: &str) -> Result<()> {
         anyhow::bail!("Provide an app name or use --all.");
     };
 
+    for app in state.apps.iter_mut() {
+        if app.name == name {
+            app.paused = true;
+        }
+    }
     if let Some(rt) = runtime.apps.get_mut(name) {
         for inst in rt.instances.values_mut() {
             if inst.pid > 0 {
-                terminate_pid_with_signal(inst.pid, sig);
-                inst.pid = 0;
-                inst.last_exit_at = Some(now);
-                inst.last_exit_signal = Some(sig);
-                inst.last_exit_code = None;
+                terminate_graceful(inst.pid, sig, Duration::from_secs(3));
             }
         }
         println!("Stopped {}", name);
     } else {
         println!("No runtime for {}", name);
     }
-    write_runtime(&runtime)?;
+    write_state(&state)?;
     Ok(())
 }
 
 fn cmd_restart(name: Option<&str>, all: bool, signal: &str) -> Result<()> {
-    cmd_stop(name, all, signal)?;
+    ensure_dirs()?;
+    let sig = parse_signal(signal)?;
+    let mut state = read_state()?;
+    let mut runtime = read_runtime()?;
+
+    if all {
+        for app in state.apps.iter_mut() {
+            app.paused = false;
+        }
+        for rt in runtime.apps.values_mut() {
+            for inst in rt.instances.values_mut() {
+                if inst.pid > 0 {
+                    terminate_graceful(inst.pid, sig, Duration::from_secs(3));
+                }
+            }
+        }
+    } else {
+        let Some(name) = name else {
+            anyhow::bail!("Provide an app name or use --all.");
+        };
+        for app in state.apps.iter_mut() {
+            if app.name == name {
+                app.paused = false;
+            }
+        }
+        if let Some(rt) = runtime.apps.get_mut(name) {
+            for inst in rt.instances.values_mut() {
+                if inst.pid > 0 {
+                    terminate_graceful(inst.pid, sig, Duration::from_secs(3));
+                }
+            }
+        }
+    }
+
+    write_state(&state)?;
     ensure_daemon_running()?;
     let target = if all {
         "all".to_string()
@@ -542,17 +590,55 @@ fn cmd_import(file: &str, replace: bool, start: bool) -> Result<()> {
     Ok(())
 }
 
-fn cmd_logs(name: &str, instance: Option<usize>, follow: bool, lines: usize) -> Result<()> {
+fn cmd_logs(
+    name: &str,
+    instance: Option<usize>,
+    follow: bool,
+    lines: usize,
+    since: Option<&str>,
+    json: bool,
+) -> Result<()> {
     ensure_dirs()?;
     let idx = instance.unwrap_or(0);
     let path = log_path(name, idx);
     if !path.exists() {
         anyhow::bail!("No log file found at {:?}", path);
     }
+    let since_time = since.map(parse_since).transpose()?;
+
     if follow {
-        follow_file(&path)
+        if let Some(since_time) = since_time {
+            let mtime = fs::metadata(&path)?.modified().unwrap_or(SystemTime::UNIX_EPOCH);
+                if mtime >= since_time {
+                    if json {
+                        let lines = read_tail_lines(&path, lines)?;
+                        for line in lines {
+                            let obj = serde_json::json!({ "line": line });
+                            println!("{obj}");
+                        }
+                    } else {
+                        print_tail(&path, lines)?;
+                    }
+                }
+            }
+        follow_file(&path, json)
     } else {
-        print_tail(&path, lines)
+        if let Some(since_time) = since_time {
+            let mtime = fs::metadata(&path)?.modified().unwrap_or(SystemTime::UNIX_EPOCH);
+            if mtime < since_time {
+                return Ok(());
+            }
+        }
+        if json {
+            let lines = read_tail_lines(&path, lines)?;
+            for line in lines {
+                let obj = serde_json::json!({ "line": line });
+                println!("{obj}");
+            }
+            Ok(())
+        } else {
+            print_tail(&path, lines)
+        }
     }
 }
 
@@ -599,6 +685,9 @@ fn cmd_uninstall() -> Result<()> {
 }
 
 fn status_watch_loop(name: Option<&str>) -> Result<()> {
+    if !std::io::stdout().is_terminal() {
+        return cmd_status(name, false, false);
+    }
     enable_raw_mode()?;
     struct RawModeGuard;
     impl Drop for RawModeGuard {
@@ -609,6 +698,9 @@ fn status_watch_loop(name: Option<&str>) -> Result<()> {
     let _guard = RawModeGuard;
 
     let filter = name.map(|s| s.to_string());
+    let mut selected_app = 0usize;
+    let mut selected_inst = 0usize;
+    let mut show_logs = false;
     loop {
         let state = read_state()?;
         let runtime = read_runtime()?;
@@ -617,7 +709,10 @@ fn status_watch_loop(name: Option<&str>) -> Result<()> {
             apps.retain(|a| a.name == name);
         }
         let snapshot = build_status_snapshot(&apps, &runtime);
-        render_status_screen(&snapshot);
+        if selected_app >= snapshot.apps.len() && !snapshot.apps.is_empty() {
+            selected_app = snapshot.apps.len() - 1;
+        }
+        render_status_screen_with_selection(&snapshot, selected_app, selected_inst, show_logs);
 
         if event::poll(Duration::from_millis(1000))? {
             if let Event::Key(key) = event::read()? {
@@ -639,6 +734,33 @@ fn status_watch_loop(name: Option<&str>) -> Result<()> {
                                 let _ = cmd_stop(None, true, "TERM");
                             }
                         }
+                        KeyCode::Char('l') => {
+                            show_logs = !show_logs;
+                        }
+                        KeyCode::Down | KeyCode::Char('j') => {
+                            if selected_app + 1 < snapshot.apps.len() {
+                                selected_app += 1;
+                                selected_inst = 0;
+                            }
+                        }
+                        KeyCode::Up | KeyCode::Char('k') => {
+                            if selected_app > 0 {
+                                selected_app -= 1;
+                                selected_inst = 0;
+                            }
+                        }
+                        KeyCode::Right | KeyCode::Char(']') => {
+                            if let Some(app) = snapshot.apps.get(selected_app) {
+                                if selected_inst + 1 < app.instances.len() {
+                                    selected_inst += 1;
+                                }
+                            }
+                        }
+                        KeyCode::Left | KeyCode::Char('[') => {
+                            if selected_inst > 0 {
+                                selected_inst -= 1;
+                            }
+                        }
                         _ => {}
                     }
                 }
@@ -648,10 +770,15 @@ fn status_watch_loop(name: Option<&str>) -> Result<()> {
     Ok(())
 }
 
-fn render_status_screen(snapshot: &StatusSnapshot) {
+fn render_status_screen_with_selection(
+    snapshot: &StatusSnapshot,
+    selected_app: usize,
+    selected_inst: usize,
+    show_logs: bool,
+) {
     print!("\x1b[2J\x1b[H");
     let now = now_ts();
-    println!("runner status  (q/ctrl+c exit, r restart, s stop)  t={now}");
+    println!("runner status  (q/ctrl+c exit, r restart, s stop, l logs, j/k app, [ ] inst)  t={now}");
 
     if snapshot.apps.is_empty() {
         println!("No apps registered.");
@@ -659,38 +786,50 @@ fn render_status_screen(snapshot: &StatusSnapshot) {
         return;
     }
 
-    for app in snapshot.apps.iter() {
+    for (i, app) in snapshot.apps.iter().enumerate() {
+        let paused = if app.paused { "paused " } else { "" };
+        let sel = if i == selected_app { ">" } else { " " };
         println!(
-            "{}: {}/{} running  restarts={}  cmd: {} {}",
+            "{sel} {}: {}/{} running  restarts={}  {}cmd: {} {}",
             app.name,
             app.running,
             app.instances_desired,
             app.total_restarts,
+            paused,
             app.cmd,
             app.args.join(" ")
         );
-        for inst in app.instances.iter() {
+        for (j, inst) in app.instances.iter().enumerate() {
             let uptime = inst.uptime_secs.map(|u| format!("{u}s")).unwrap_or("-".to_string());
-            let last_exit = inst
-                .last_exit_at
-                .map(|t| t.to_string())
-                .unwrap_or_else(|| "-".to_string());
-            let code = inst
-                .last_exit_code
-                .map(|c| c.to_string())
-                .unwrap_or_else(|| "-".to_string());
-            let sig = inst
-                .last_exit_signal
-                .map(|s| s.to_string())
-                .unwrap_or_else(|| "-".to_string());
+            let pid = inst.pid.unwrap_or(0);
+            let mark = if i == selected_app && j == selected_inst { "*" } else { " " };
             println!(
-                "  [{idx}] pid={pid:<6} {state:<4} uptime={uptime:<6} restarts={restarts:<3} last_exit_at={last_exit} code={code} sig={sig}",
+                "  {mark}[{idx}] pid={pid:<6} {state:<4} uptime={uptime:<6} restarts={restarts:<3}",
                 idx = inst.index,
-                pid = inst.pid.unwrap_or(0),
                 state = if inst.alive { "up" } else { "down" },
                 uptime = uptime,
                 restarts = inst.restarts
             );
+        }
+    }
+
+    if show_logs {
+        if let Some(app) = snapshot.apps.get(selected_app) {
+            let inst = app.instances.get(selected_inst);
+            if let Some(inst) = inst {
+                println!("\n--- logs: {}[{}] (tail 20) ---", app.name, inst.index);
+                let path = log_path(&app.name, inst.index);
+                match read_tail_lines(&path, 20) {
+                    Ok(lines) => {
+                        for line in lines {
+                            println!("{line}");
+                        }
+                    }
+                    Err(err) => {
+                        println!("(unable to read log: {err})");
+                    }
+                }
+            }
         }
     }
     let _ = std::io::stdout().flush();
@@ -710,6 +849,7 @@ struct StatusApp {
     instances_desired: usize,
     running: usize,
     total_restarts: u64,
+    paused: bool,
     instances: Vec<StatusInstance>,
 }
 
@@ -766,6 +906,7 @@ fn build_status_snapshot(apps: &[AppConfig], runtime: &Runtime) -> StatusSnapsho
             instances_desired: app.instances,
             running,
             total_restarts,
+            paused: app.paused,
             instances,
         });
     }
@@ -825,7 +966,8 @@ fn daemon_loop(watch: bool) -> Result<()> {
                 rt.instances.remove(&idx);
             }
 
-            for idx in 0..app.instances {
+            let desired_instances = if app.paused { 0 } else { app.instances };
+            for idx in 0..desired_instances {
                 let inst = rt.instances.entry(idx).or_default();
                 if inst.pid == 0 {
                     match spawn_instance(app, idx) {
@@ -847,7 +989,7 @@ fn daemon_loop(watch: bool) -> Result<()> {
         write_runtime(&runtime)?;
         if watch {
             let snapshot = build_status_snapshot(&state.apps, &runtime);
-            render_status_screen(&snapshot);
+            render_status_screen_with_selection(&snapshot, 0, 0, false);
         }
         thread::sleep(Duration::from_secs(2));
     }
@@ -1015,7 +1157,7 @@ fn read_pid_file() -> Result<Option<i32>> {
     Ok(Some(pid))
 }
 
-fn follow_file(path: &Path) -> Result<()> {
+fn follow_file(path: &Path, json: bool) -> Result<()> {
     let mut f = File::open(path)?;
     let mut pos = f.seek(SeekFrom::End(0))?;
     loop {
@@ -1024,7 +1166,14 @@ fn follow_file(path: &Path) -> Result<()> {
         if new_pos > pos {
             f.seek(SeekFrom::Start(pos))?;
             f.read_to_string(&mut buf)?;
-            print!("{buf}");
+            if json {
+                for line in buf.lines() {
+                    let obj = serde_json::json!({ "line": line });
+                    println!("{obj}");
+                }
+            } else {
+                print!("{buf}");
+            }
             pos = new_pos;
         }
         thread::sleep(Duration::from_millis(500));
@@ -1032,14 +1181,37 @@ fn follow_file(path: &Path) -> Result<()> {
 }
 
 fn print_tail(path: &Path, lines: usize) -> Result<()> {
-    let mut buf = String::new();
-    File::open(path)?.read_to_string(&mut buf)?;
-    let mut out = Vec::new();
-    for line in buf.lines().rev().take(lines).collect::<Vec<_>>().into_iter().rev() {
-        out.push(line);
-    }
-    println!("{}", out.join("\n"));
+    let lines = read_tail_lines(path, lines)?;
+    println!("{}", lines.join("\n"));
     Ok(())
+}
+
+fn read_tail_lines(path: &Path, lines: usize) -> Result<Vec<String>> {
+    if lines == 0 {
+        return Ok(Vec::new());
+    }
+    let mut f = File::open(path)?;
+    let mut pos = f.seek(SeekFrom::End(0))?;
+    let mut buf: Vec<u8> = Vec::new();
+    let mut found = 0usize;
+    const CHUNK: usize = 8 * 1024;
+
+    while pos > 0 && found <= lines {
+        let read_size = std::cmp::min(CHUNK as u64, pos) as usize;
+        pos -= read_size as u64;
+        f.seek(SeekFrom::Start(pos))?;
+        let mut chunk = vec![0u8; read_size];
+        f.read_exact(&mut chunk)?;
+        found += chunk.iter().filter(|&&b| b == b'\n').count();
+        let mut new_buf = chunk;
+        new_buf.extend_from_slice(&buf);
+        buf = new_buf;
+    }
+
+    let text = String::from_utf8_lossy(&buf);
+    let all_lines: Vec<&str> = text.lines().collect();
+    let start = all_lines.len().saturating_sub(lines);
+    Ok(all_lines[start..].iter().map(|s| s.to_string()).collect())
 }
 
 #[derive(Debug, Default, Clone, Copy)]
@@ -1106,6 +1278,30 @@ fn load_env_file(path: &str) -> Result<Vec<(String, String)>> {
         out.push((key.to_string(), value));
     }
     Ok(out)
+}
+
+fn parse_since(input: &str) -> Result<SystemTime> {
+    let s = input.trim();
+    if s.is_empty() {
+        anyhow::bail!("--since is empty");
+    }
+    if let Ok(ts) = s.parse::<u64>() {
+        return Ok(UNIX_EPOCH + Duration::from_secs(ts));
+    }
+    let (num, unit) = s.split_at(s.len() - 1);
+    let value: u64 = num
+        .parse()
+        .with_context(|| format!("invalid --since value: {input}"))?;
+    let secs = match unit {
+        "s" | "S" => value,
+        "m" | "M" => value * 60,
+        "h" | "H" => value * 60 * 60,
+        "d" | "D" => value * 60 * 60 * 24,
+        _ => anyhow::bail!("invalid --since unit: {input} (use s/m/h/d or unix seconds)"),
+    };
+    Ok(SystemTime::now()
+        .checked_sub(Duration::from_secs(secs))
+        .unwrap_or(UNIX_EPOCH))
 }
 
 #[cfg(test)]
@@ -1241,6 +1437,17 @@ EMPTY=
         assert_eq!(super::parse_signal("SIGKILL").unwrap(), libc::SIGKILL);
         assert_eq!(super::parse_signal("2").unwrap(), 2);
     }
+
+    #[test]
+    fn parse_since_duration() {
+        let since = super::parse_since("10m").expect("since");
+        let now = std::time::SystemTime::now();
+        let delta = now
+            .duration_since(since)
+            .unwrap_or_else(|_| std::time::Duration::from_secs(0))
+            .as_secs();
+        assert!(delta >= 9 * 60 && delta <= 11 * 60);
+    }
 }
 
 fn terminate_pid(pid: i32) {
@@ -1252,6 +1459,24 @@ fn terminate_pid_with_signal(pid: i32, signal: i32) {
     unsafe {
         libc::kill(pid, signal);
     }
+}
+
+fn terminate_graceful(pid: i32, signal: i32, timeout: Duration) {
+    if pid <= 0 {
+        return;
+    }
+    terminate_pid_with_signal(pid, signal);
+    if signal == libc::SIGKILL {
+        return;
+    }
+    let deadline = std::time::Instant::now() + timeout;
+    while std::time::Instant::now() < deadline {
+        if !is_pid_alive(pid) {
+            return;
+        }
+        thread::sleep(Duration::from_millis(100));
+    }
+    terminate_pid_with_signal(pid, libc::SIGKILL);
 }
 
 fn parse_signal(signal: &str) -> Result<i32> {
