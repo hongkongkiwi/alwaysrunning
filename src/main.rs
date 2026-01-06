@@ -3,6 +3,13 @@ use clap::{Parser, Subcommand};
 use serde::{Deserialize, Serialize};
 use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
 use crossterm::terminal::{disable_raw_mode, enable_raw_mode};
+#[cfg(windows)]
+use windows_sys::Win32::Foundation::{CloseHandle, STILL_ACTIVE};
+#[cfg(windows)]
+use windows_sys::Win32::System::Threading::{
+    GetExitCodeProcess, OpenProcess, TerminateProcess, PROCESS_QUERY_LIMITED_INFORMATION,
+    PROCESS_TERMINATE,
+};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write, IsTerminal};
@@ -1243,7 +1250,34 @@ fn check_exit_status(pid: i32) -> Option<ExitInfo> {
     Some(info)
 }
 
-#[cfg(not(unix))]
+#[cfg(windows)]
+fn check_exit_status(pid: i32) -> Option<ExitInfo> {
+    if pid <= 0 {
+        return None;
+    }
+    unsafe {
+        let handle = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid as u32);
+        if handle == 0 {
+            return None;
+        }
+        let mut code: u32 = 0;
+        let ok = GetExitCodeProcess(handle, &mut code);
+        CloseHandle(handle);
+        if ok == 0 {
+            return None;
+        }
+        if code == STILL_ACTIVE {
+            None
+        } else {
+            Some(ExitInfo {
+                code: Some(code as i32),
+                signal: None,
+            })
+        }
+    }
+}
+
+#[cfg(all(not(unix), not(windows)))]
 fn check_exit_status(_pid: i32) -> Option<ExitInfo> {
     None
 }
@@ -1439,6 +1473,13 @@ EMPTY=
     }
 
     #[test]
+    #[cfg(windows)]
+    fn parse_signal_variants_windows() {
+        assert!(super::parse_signal("TERM").is_ok());
+        assert!(super::parse_signal("KILL").is_ok());
+    }
+
+    #[test]
     fn parse_since_duration() {
         let since = super::parse_since("10m").expect("since");
         let now = std::time::SystemTime::now();
@@ -1455,7 +1496,12 @@ fn terminate_pid(pid: i32) {
     terminate_pid_with_signal(pid, libc::SIGTERM);
 }
 
-#[cfg(not(unix))]
+#[cfg(windows)]
+fn terminate_pid(pid: i32) {
+    terminate_pid_with_signal(pid, 0);
+}
+
+#[cfg(all(not(unix), not(windows)))]
 fn terminate_pid(_pid: i32) {}
 
 #[cfg(unix)]
@@ -1465,7 +1511,22 @@ fn terminate_pid_with_signal(pid: i32, signal: i32) {
     }
 }
 
-#[cfg(not(unix))]
+#[cfg(windows)]
+fn terminate_pid_with_signal(pid: i32, _signal: i32) {
+    if pid <= 0 {
+        return;
+    }
+    unsafe {
+        let handle = OpenProcess(PROCESS_TERMINATE, 0, pid as u32);
+        if handle == 0 {
+            return;
+        }
+        let _ = TerminateProcess(handle, 1);
+        CloseHandle(handle);
+    }
+}
+
+#[cfg(all(not(unix), not(windows)))]
 fn terminate_pid_with_signal(_pid: i32, _signal: i32) {}
 
 #[cfg(unix)]
@@ -1487,11 +1548,30 @@ fn terminate_graceful(pid: i32, signal: i32, timeout: Duration) {
     terminate_pid_with_signal(pid, libc::SIGKILL);
 }
 
-#[cfg(not(unix))]
+#[cfg(windows)]
+fn terminate_graceful(pid: i32, _signal: i32, _timeout: Duration) {
+    terminate_pid_with_signal(pid, 0);
+}
+
+#[cfg(all(not(unix), not(windows)))]
 fn terminate_graceful(_pid: i32, _signal: i32, _timeout: Duration) {}
 
 fn parse_signal(signal: &str) -> Result<i32> {
-    #[cfg(not(unix))]
+    #[cfg(windows)]
+    {
+        let s = signal.trim().to_uppercase();
+        if s.parse::<i32>().is_ok() {
+            return Ok(0);
+        }
+        let s = s.strip_prefix("SIG").unwrap_or(&s);
+        match s {
+            "TERM" | "KILL" | "INT" | "HUP" | "QUIT" | "USR1" | "USR2" | "STOP" | "CONT" => {
+                Ok(0)
+            }
+            _ => anyhow::bail!("Unknown signal: {signal}"),
+        }
+    }
+    #[cfg(all(not(unix), not(windows)))]
     {
         let _ = signal;
         anyhow::bail!("Signals are not supported on this OS.");
@@ -1532,7 +1612,18 @@ fn is_pid_alive(pid: i32) -> bool {
         let err = last_errno();
         return err == libc::EPERM;
     }
-    #[cfg(not(unix))]
+    #[cfg(windows)]
+    unsafe {
+        let handle = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid as u32);
+        if handle == 0 {
+            return false;
+        }
+        let mut code: u32 = 0;
+        let ok = GetExitCodeProcess(handle, &mut code);
+        CloseHandle(handle);
+        ok != 0 && code == STILL_ACTIVE
+    }
+    #[cfg(all(not(unix), not(windows)))]
     {
         let _ = pid;
         false

@@ -22,6 +22,8 @@ That’s it.
 
 Download a prebuilt `runner` binary from the GitHub Releases page and put it in your PATH.
 
+Supported OS: macOS, Linux, Windows. Autostart setup is currently macOS/Linux only.
+
 ### From source
 
 ```bash
@@ -152,6 +154,8 @@ runner stop myapp --signal KILL
 runner restart myapp --signal HUP
 ```
 
+On Windows, signals are accepted but behave as a forceful terminate.
+
 ## Files & data layout
 
 Runner stores state in your home directory:
@@ -192,6 +196,9 @@ binaries automatically.
 git tag v0.1.2
 git push origin v0.1.2
 ```
+
+Manual release: trigger the `manual-release` workflow in GitHub Actions and
+enter a version like `0.1.2`. It will create the tag and kick off the build.
 
 ## License
 
