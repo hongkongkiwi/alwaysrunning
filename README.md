@@ -156,6 +156,12 @@ runner restart myapp --signal HUP
 
 On Windows, signals are accepted but behave as a forceful terminate.
 
+## Windows notes
+
+- Autostart (`runner install`) is not supported on Windows yet.
+- `--signal` is treated as a forceful terminate.
+- Process liveness and exit codes are derived from Windows process APIs.
+
 ## Files & data layout
 
 Runner stores state in your home directory:
