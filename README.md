@@ -183,6 +183,16 @@ PRs welcome. Keep it simple and low‑dependency. Run tests with:
 cargo test
 ```
 
+## Releasing
+
+Create and push a semantic tag. The GitHub Actions workflow will build and attach
+binaries automatically.
+
+```bash
+git tag v0.1.2
+git push origin v0.1.2
+```
+
 ## License
 
 MIT
