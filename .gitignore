@@ -1,0 +1,10 @@
+/target
+.DS_Store
+.env
+.env.*
+.idea/
+.vscode/
+*.log
+*.pid
+*.tmp
+*.swp
