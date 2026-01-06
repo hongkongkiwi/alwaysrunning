@@ -1,6 +1,9 @@
 name: release
 
 on:
+  push:
+    tags:
+      - "v*.*.*"
   release:
     types: [created]
 
@@ -48,3 +51,5 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           files: ${{ env.ASSET }}
+          tag_name: ${{ github.event.release.tag_name || github.ref_name }}
+          generate_release_notes: true
