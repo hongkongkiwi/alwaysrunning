@@ -1450,17 +1450,25 @@ EMPTY=
     }
 }
 
+#[cfg(unix)]
 fn terminate_pid(pid: i32) {
     terminate_pid_with_signal(pid, libc::SIGTERM);
 }
 
+#[cfg(not(unix))]
+fn terminate_pid(_pid: i32) {}
+
+#[cfg(unix)]
 fn terminate_pid_with_signal(pid: i32, signal: i32) {
-    #[cfg(unix)]
     unsafe {
         libc::kill(pid, signal);
     }
 }
 
+#[cfg(not(unix))]
+fn terminate_pid_with_signal(_pid: i32, _signal: i32) {}
+
+#[cfg(unix)]
 fn terminate_graceful(pid: i32, signal: i32, timeout: Duration) {
     if pid <= 0 {
         return;
@@ -1478,6 +1486,9 @@ fn terminate_graceful(pid: i32, signal: i32, timeout: Duration) {
     }
     terminate_pid_with_signal(pid, libc::SIGKILL);
 }
+
+#[cfg(not(unix))]
+fn terminate_graceful(_pid: i32, _signal: i32, _timeout: Duration) {}
 
 fn parse_signal(signal: &str) -> Result<i32> {
     #[cfg(not(unix))]
