@@ -1,21 +1,189 @@
-name: release
+# Release workflow - builds and publishes binaries/packages
+
+name: Release
 
 on:
   push:
     tags:
-      - "v*.*.*"
+      - 'v*.*.*'
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Version number (e.g., 0.1.1) - required for manual trigger'
+        required: true
+        type: string
 
 permissions:
   contents: write
+  packages: write
+
+env:
+  CARGO_TERM_COLOR: always
 
 jobs:
-  build:
+  # Build Linux binaries (needed by .deb/.rpm packages)
+  build-linux:
+    name: Build Linux (${{ matrix.target }})
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-latest, windows-latest]
+        include:
+          # Linux x86_64 (glibc)
+          - os: ubuntu-24.04
+            target: x86_64-unknown-linux-gnu
+          # Linux arm64 (glibc)
+          - os: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
 
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Cache Rust build artifacts
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: ${{ runner.os }}-${{ hashFiles('**/Cargo.lock') }}-${{ hashFiles('rust-toolchain*') }}
+
+      - name: Build release binary
+        run: cargo build --release --target ${{ matrix.target }}
+
+      - name: Upload binary
+        uses: actions/upload-artifact@v4
+        with:
+          name: binary-${{ matrix.target }}
+          path: target/${{ matrix.target }}/release/alwaysrunning
+          retention-days: 5
+
+  # Build binaries for non-Linux platforms
+  build:
+    name: Build (${{ matrix.target }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # macOS Intel
+          - os: macos-14
+            target: x86_64-apple-darwin
+          # macOS Apple Silicon
+          - os: macos-latest
+            target: aarch64-apple-darwin
+          # Windows
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Cache Rust build artifacts
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: ${{ runner.os }}-${{ hashFiles('**/Cargo.lock') }}-${{ hashFiles('rust-toolchain*') }}
+
+      - name: Build release binary
+        run: cargo build --release --target ${{ matrix.target }}
+
+      - name: Upload binary
+        uses: actions/upload-artifact@v4
+        with:
+          name: binary-${{ matrix.target }}
+          path: target/${{ matrix.target }}/release/alwaysrunning${{ matrix.target == 'x86_64-pc-windows-msvc' && '.exe' || '' }}
+          retention-days: 5
+
+  # Create GitHub release
+  release:
+    name: Create Release
+    needs:
+      - build
+      - build-linux
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Download all binaries
+        uses: actions/download-artifact@v4
+        with:
+          path: binaries
+          pattern: binary-*
+          merge-multiple: false
+
+      - name: Determine version
+        id: version
+        run: |
+          VERSION_RAW="${{ github.event.inputs.version || github.ref_name }}"
+          VERSION="${VERSION_RAW#v}"
+          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
+
+      - name: Prepare release assets
+        run: |
+          VERSION="${{ steps.version.outputs.version }}"
+          mkdir -p release
+          for dir in binaries/binary-*; do
+            target=$(basename "$dir" | sed 's/binary-//')
+            case "$target" in
+              x86_64-pc-windows-msvc)
+                if [ -f "$dir/alwaysrunning.exe" ]; then
+                  (cd "$dir" && zip -r "$GITHUB_WORKSPACE/release/alwaysrunning-v${VERSION}-${target}.zip" alwaysrunning.exe)
+                fi
+                ;;
+              *)
+                if [ -f "$dir/alwaysrunning" ]; then
+                  tmpdir=$(mktemp -d)
+                  cp "$dir/alwaysrunning" "$tmpdir/alwaysrunning"
+                  if [ -f "alwaysrunning.example.toml" ]; then
+                    cp "alwaysrunning.example.toml" "$tmpdir/alwaysrunning.example.toml"
+                  fi
+                  tar -C "$tmpdir" -czf "release/alwaysrunning-v${VERSION}-${target}.tar.gz" .
+                  rm -rf "$tmpdir"
+                fi
+                ;;
+            esac
+          done
+
+          ls -la release
+
+          # Verify release artifacts were created
+          if [ -z "$(ls -A release/ 2>/dev/null)" ]; then
+            echo "ERROR: No release artifacts were created!"
+            ls -la binaries/
+            exit 1
+          fi
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2.5.0
+        with:
+          draft: false
+          prerelease: false
+          generate_release_notes: true
+          tag_name: v${{ steps.version.outputs.version }}
+          name: v${{ steps.version.outputs.version }}
+          files: release/*
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Upload release binaries for finalize job
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-binaries
+          path: release/
+          retention-days: 5
+
+  # Publish to crates.io
+  publish-crates:
+    name: Publish to crates.io
+    needs: release
+    runs-on: ubuntu-latest
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -23,31 +191,570 @@ jobs:
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
 
-      - name: Build
-        run: cargo build --release
-
-      - name: Package (unix)
-        if: runner.os != 'Windows'
-        shell: bash
-        run: |
-          set -euo pipefail
-          ARCH="$(uname -m)"
-          ASSET="alwaysrunning-${{ runner.os }}-${ARCH}.tar.gz"
-          tar -czf "${ASSET}" -C target/release runner
-          echo "ASSET=${ASSET}" >> "$GITHUB_ENV"
-
-      - name: Package (windows)
-        if: runner.os == 'Windows'
-        shell: pwsh
-        run: |
-          $arch = $env:PROCESSOR_ARCHITECTURE
-          $asset = "alwaysrunning-${{ runner.os }}-$arch.zip"
-          Compress-Archive -Path target\release\runner.exe -DestinationPath $asset
-          "ASSET=$asset" | Out-File -FilePath $env:GITHUB_ENV -Append
-
-      - name: Upload release asset
-        uses: softprops/action-gh-release@v2
+      - name: Cache Rust build artifacts
+        uses: Swatinem/rust-cache@v2
         with:
-          files: ${{ env.ASSET }}
-          tag_name: ${{ github.ref_name }}
-          generate_release_notes: true
+          shared-key: ${{ runner.os }}-${{ hashFiles('**/Cargo.lock') }}-${{ hashFiles('rust-toolchain*') }}
+
+      - name: Publish to crates.io
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+        run: |
+          if [ -n "$CARGO_REGISTRY_TOKEN" ]; then
+            cargo publish --registry crates-io --allow-dirty
+          else
+            echo "CARGO_REGISTRY_TOKEN not set, skipping crates.io publish"
+          fi
+
+  # Publish to GitHub Packages (Docker images)
+  publish-docker:
+    name: Publish Docker Image (Multi-Arch)
+    needs:
+      - build-apk
+      - build-linux
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Download Linux musl binaries (amd64)
+        uses: actions/download-artifact@v4
+        with:
+          name: binary-x86_64-unknown-linux-musl
+          path: docker-bin/amd64
+
+      - name: Download Linux musl binaries (arm64)
+        uses: actions/download-artifact@v4
+        with:
+          name: binary-aarch64-unknown-linux-musl
+          path: docker-bin/arm64
+
+      - name: Prepare Docker binaries
+        run: |
+          mkdir -p docker-bin
+          mv docker-bin/amd64/alwaysrunning docker-bin/alwaysrunning-amd64
+          mv docker-bin/arm64/alwaysrunning docker-bin/alwaysrunning-arm64
+          chmod +x docker-bin/alwaysrunning-amd64 docker-bin/alwaysrunning-arm64
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Set up QEMU for multi-arch builds
+        uses: docker/setup-qemu-action@v3
+        with:
+          platforms: amd64,arm64
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Extract metadata for Docker
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ghcr.io/${{ github.repository }}
+          tags: |
+            type=ref,event=tag
+            type=raw,value=latest,enable={{is_default_branch}}
+
+      - name: Prepare OCR tags
+        id: ocr-tags
+        run: |
+          ocr_tags=$(echo "${{ steps.meta.outputs.tags }}" | sed 's/$/-ocr/' | paste -sd, -)
+          echo "tags=${ocr_tags}" >> "$GITHUB_OUTPUT"
+
+      - name: Build and push multi-architecture Docker image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          platforms: linux/amd64,linux/arm64
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Build and push multi-architecture Docker image (OCR)
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: Dockerfile.ocr
+          push: true
+          tags: ${{ steps.ocr-tags.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          platforms: linux/amd64,linux/arm64
+          build-args: |
+            OCR_LANGS=eng
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+  # Build platform-specific packages
+  build-deb:
+    name: Build Debian Package (${{ matrix.arch }})
+    needs: build-linux
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            runner: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            deb_arch: amd64
+          - arch: arm64
+            runner: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+            deb_arch: arm64
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Cache Rust build artifacts
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: ${{ runner.os }}-${{ hashFiles('**/Cargo.lock') }}-${{ hashFiles('rust-toolchain*') }}
+
+      - name: Install cargo-deb
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-deb
+
+      - name: Download release binary
+        uses: actions/download-artifact@v4
+        with:
+          name: binary-${{ matrix.target }}
+          path: target/${{ matrix.target }}/release
+
+      - name: Build .deb package
+        run: cargo deb --target ${{ matrix.target }} --no-build
+
+      - name: Upload .deb package
+        uses: actions/upload-artifact@v4
+        with:
+          name: alwaysrunning.deb-${{ matrix.arch }}
+          path: target/${{ matrix.target }}/debian/*_${{ matrix.deb_arch }}.deb
+
+  build-rpm:
+    name: Build RedHat Package (${{ matrix.arch }})
+    needs: build-linux
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            runner: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            rpm_arch: x86_64
+          - arch: arm64
+            runner: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+            rpm_arch: aarch64
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Download release binary
+        uses: actions/download-artifact@v4
+        with:
+          name: binary-${{ matrix.target }}
+          path: target/${{ matrix.target }}/release
+
+      - name: Install rpm build tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y rpm
+
+      - name: Create RPM structure
+        run: |
+          VERSION="${{ github.event.inputs.version || github.ref_name }}"
+          VERSION="${VERSION#v}"
+          pkgname="alwaysrunning"
+          # Get current date for changelog (format: "Day Month DD YYYY")
+          CHANGELOG_DATE=$(date '+%a %b %d %Y')
+
+          mkdir -p rpmbuild/BUILD rpmbuild/BUILDROOT rpmbuild/RPMS rpmbuild/SOURCES rpmbuild/SPECS rpmbuild/SRPMS
+
+          # Create tarball with proper directory structure (tarball name without .tar.gz must match extracted dir)
+          mkdir -p "tmp-pkg-dir/${pkgname}-${VERSION}"
+          cp target/${{ matrix.target }}/release/alwaysrunning "tmp-pkg-dir/${pkgname}-${VERSION}/"
+          tar -C tmp-pkg-dir -czf "rpmbuild/SOURCES/${pkgname}-${VERSION}.tar.gz" "${pkgname}-${VERSION}"
+          rm -rf tmp-pkg-dir
+
+          # Create spec file
+          cat > rpmbuild/SPECS/alwaysrunning.spec << EOF
+          Name:           ${pkgname}
+          Version:        ${VERSION}
+          Release:        0%{?dist}
+          Summary:        Model Context Protocol server for academic research sources
+          License:        MIT
+          URL:            https://github.com/hongkongkiwi/alwaysrunning
+          Source0:        %{name}-%{version}.tar.gz
+          BuildArch:      ${{ matrix.rpm_arch }}
+          %description
+          Model Context Protocol server that provides unified access to 26+ academic
+          research sources (arXiv, Semantic Scholar, PubMed, OpenAlex, etc.) for
+          searching, downloading, and analyzing academic papers.
+
+          %prep
+          %setup -q
+
+          %install
+          mkdir -p %{buildroot}/usr/bin
+          install -m 755 %{_builddir}/%{name}-%{version}/%{name} %{buildroot}/usr/bin/%{name}
+
+          %files
+          /usr/bin/%{name}
+          %changelog
+          * ${CHANGELOG_DATE} Research Master <alwaysrunning@users.noreply.github.com> - ${VERSION}-0
+          - Version ${VERSION} release
+          EOF
+
+      - name: Build .rpm package
+        run: |
+          rpmbuild --define "_topdir $PWD/rpmbuild" \
+            -bb rpmbuild/SPECS/alwaysrunning.spec \
+            --target ${{ matrix.rpm_arch }}
+
+      - name: Upload .rpm package
+        uses: actions/upload-artifact@v4
+        with:
+          name: alwaysrunning.rpm-${{ matrix.arch }}
+          path: rpmbuild/RPMS/${{ matrix.rpm_arch }}/*.rpm
+
+  build-apk:
+    name: Build Alpine Package (${{ matrix.arch }})
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            runner: ubuntu-latest
+            target: x86_64-unknown-linux-musl
+            apk_arch: x86_64
+          - arch: arm64
+            runner: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-musl
+            apk_arch: aarch64
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust and musl-tools
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Cache Rust build artifacts
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: ${{ runner.os }}-${{ hashFiles('**/Cargo.lock') }}-${{ hashFiles('rust-toolchain*') }}
+
+      - name: Install musl tools
+        run: |
+          sudo apt-get update
+          if [ "${{ matrix.arch }}" = "amd64" ]; then
+            sudo apt-get install -y musl-tools gcc-multilib
+          else
+            sudo apt-get install -y musl-tools
+          fi
+
+      - name: Build static binary
+        run: cargo build --release --target ${{ matrix.target }}
+
+      - name: Create Alpine package structure
+        run: |
+          mkdir -p apk-build/bin
+          cp target/${{ matrix.target }}/release/alwaysrunning apk-build/bin/
+
+      - name: Upload Linux musl binary
+        uses: actions/upload-artifact@v4
+        with:
+          name: binary-${{ matrix.target }}
+          path: target/${{ matrix.target }}/release/alwaysrunning
+          retention-days: 5
+
+      - name: Create APKBUILD
+        run: |
+          VERSION="${{ github.event.inputs.version || github.ref_name }}"
+          VERSION="${VERSION#v}"
+          cat > apk-build/APKBUILD << 'EOF'
+          # Contributor: Research Master <alwaysrunning@users.noreply.github.com>
+          # Maintainer: Research Master <alwaysrunning@users.noreply.github.com>
+          pkgname=alwaysrunning
+          pkgver=VERSION_PLACEHOLDER
+          pkgrel=0
+          pkgdesc="Model Context Protocol server for academic research sources"
+          url="https://github.com/hongkongkiwi/alwaysrunning"
+          arch="${{ matrix.apk_arch }}"
+          license="MIT"
+          depends=""
+          subpackages=""
+          source=""
+          options="!check"
+
+          build() {
+            return 0
+          }
+
+          package() {
+            mkdir -p "$pkgdir"/usr/bin
+            install -m 755 "$startdir"/bin/alwaysrunning "$pkgdir"/usr/bin/alwaysrunning
+          }
+          EOF
+          sed -i "s/VERSION_PLACEHOLDER/${VERSION}/" apk-build/APKBUILD
+
+      - name: Build .apk package
+        run: |
+          mkdir -p apk-packages
+          docker run --rm \
+            -v "$PWD:/work" \
+            -w /work/apk-build \
+            alpine:3.19 \
+            sh -c 'apk add --no-cache alpine-sdk && \
+              adduser -D builder && addgroup builder abuild && \
+              chown -R builder:builder /work/apk-build /work/apk-packages && \
+              su builder -c "export REPODEST=/work/apk-packages PACKAGER= && abuild-keygen -a -n" && \
+              cp /home/builder/.abuild/*.rsa.pub /etc/apk/keys/ && \
+              su builder -c "export REPODEST=/work/apk-packages PACKAGER= && abuild -r"'
+
+      - name: Upload Alpine package
+        uses: actions/upload-artifact@v4
+        with:
+          name: alwaysrunning.apk-${{ matrix.arch }}
+          path: apk-packages/**/*.apk
+
+  # Create release with all platform packages
+  finalize-release:
+    name: Finalize Release
+    needs:
+      - release
+      - build-deb
+      - build-rpm
+      - build-apk
+      - publish-docker
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download release assets
+        uses: actions/download-artifact@v4
+        with:
+          name: release-binaries
+          path: release-assets
+
+      - name: List downloaded assets
+        run: |
+          echo "=== release-assets contents ==="
+          find release-assets -type f -exec ls -la {} \;
+
+      - name: Download all packages
+        uses: actions/download-artifact@v4
+        with:
+          path: packages
+          pattern: alwaysrunning.*
+          merge-multiple: false
+
+      - name: Prepare release assets
+        run: |
+          mkdir -p release-packages
+
+          # Copy release assets (upload-artifact keeps the `release/` dir)
+          if [ -d release-assets/release ]; then
+            cp -r release-assets/release/* release-packages/ 2>/dev/null || true
+          else
+            cp -r release-assets/* release-packages/ 2>/dev/null || true
+          fi
+
+          # Copy platform packages
+          for dir in packages/*; do
+            if [ -d "$dir" ]; then
+              cp -r "$dir"/* release-packages/ 2>/dev/null || true
+            fi
+          done
+
+          ls -la release-packages/
+
+      - name: Generate SHA256 checksums
+        run: |
+          cd release-packages
+          find . -maxdepth 1 -type f -exec sha256sum {} \; > SHA256SUMS.txt
+          cat SHA256SUMS.txt
+
+      - name: Setup GPG for signing
+        if: env.GPG_PRIVATE_KEY != ''
+        uses: actions/cache@v4
+        with:
+          path: ~/.gnupg
+          key: gpg-key-${{ env.GPG_PRIVATE_KEY }}
+
+      - name: Import GPG key
+        if: env.GPG_PRIVATE_KEY != ''
+        run: |
+          echo '${{ env.GPG_PRIVATE_KEY }}' | gpg --batch --import --
+          gpg --list-secret-keys --keyid-format LONG
+
+      - name: Sign checksums
+        if: env.GPG_PRIVATE_KEY != ''
+        run: |
+          cd release-packages
+          gpg --batch --yes --armor --detach-sign SHA256SUMS.txt
+          cat SHA256SUMS.txt.asc
+
+      - name: Upload SHA256 checksums
+        uses: actions/upload-artifact@v4
+        with:
+          name: sha256sums
+          path: release-packages/SHA256SUMS.txt
+          retention-days: 5
+
+      - name: Upload GPG signature
+        if: env.GPG_PRIVATE_KEY != ''
+        uses: actions/upload-artifact@v4
+        with:
+          name: sha256sums-asc
+          path: release-packages/SHA256SUMS.txt.asc
+          retention-days: 5
+
+      - name: Update GitHub Release
+        uses: softprops/action-gh-release@v2.5.0
+        with:
+          draft: false
+          prerelease: false
+          files: release-packages/*
+
+  update-homebrew:
+    name: Update Homebrew Formula
+    needs: finalize-release
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout homebrew-alwaysrunning
+        uses: actions/checkout@v4
+        with:
+          repository: hongkongkiwi/homebrew-alwaysrunning
+          token: ${{ secrets.HOMEBREW_UPDATE_TOKEN }}
+          path: homebrew-tap
+
+      - name: Download SHA256 checksums
+        uses: actions/download-artifact@v4
+        with:
+          name: sha256sums
+          path: homebrew-tmp
+
+      - name: Extract SHA256 checksums for all platforms
+        id: sha256
+        run: |
+          # Extract SHA256 for each platform (files include version prefix like v0.1.32)
+          # Note: Use simplified patterns to avoid YAML escaping issues with backslashes
+          SHA256_X86_64_DARWIN=$(grep 'x86_64-apple-darwin.*tar\.gz$' homebrew-tmp/SHA256SUMS.txt | awk '{print $1}' || true)
+          SHA256_AARCH64_DARWIN=$(grep 'aarch64-apple-darwin.*tar\.gz$' homebrew-tmp/SHA256SUMS.txt | awk '{print $1}' || true)
+          SHA256_X86_64_LINUX=$(grep 'x86_64-unknown-linux-gnu.*tar\.gz$' homebrew-tmp/SHA256SUMS.txt | awk '{print $1}' || true)
+          SHA256_AARCH64_LINUX=$(grep 'aarch64-unknown-linux-gnu.*tar\.gz$' homebrew-tmp/SHA256SUMS.txt | awk '{print $1}' || true)
+
+          for value in "$SHA256_X86_64_DARWIN" "$SHA256_AARCH64_DARWIN" "$SHA256_X86_64_LINUX" "$SHA256_AARCH64_LINUX"; do
+            if [ -z "$value" ]; then
+              echo "Missing SHA256 checksum for one or more platforms" >&2
+              exit 1
+            fi
+          done
+
+          {
+            echo "sha256_x86_64_darwin=${SHA256_X86_64_DARWIN}"
+            echo "sha256_aarch64_darwin=${SHA256_AARCH64_DARWIN}"
+            echo "sha256_x86_64_linux=${SHA256_X86_64_LINUX}"
+            echo "sha256_aarch64_linux=${SHA256_AARCH64_LINUX}"
+          } >> "$GITHUB_OUTPUT"
+          echo "SHA256 x86_64-darwin: $SHA256_X86_64_DARWIN"
+          echo "SHA256 aarch64-darwin: $SHA256_AARCH64_DARWIN"
+          echo "SHA256 x86_64-linux: $SHA256_X86_64_LINUX"
+          echo "SHA256 aarch64-linux: $SHA256_AARCH64_LINUX"
+
+      - name: Update Homebrew formula
+        run: |
+          VERSION_RAW='${{ github.event.inputs.version || github.ref_name }}'
+          VERSION="${VERSION_RAW#v}"
+          SHA256_X86_64_DARWIN="${{ steps.sha256.outputs.sha256_x86_64_darwin }}"
+          SHA256_AARCH64_DARWIN="${{ steps.sha256.outputs.sha256_aarch64_darwin }}"
+          SHA256_X86_64_LINUX="${{ steps.sha256.outputs.sha256_x86_64_linux }}"
+          SHA256_AARCH64_LINUX="${{ steps.sha256.outputs.sha256_aarch64_linux }}"
+
+          cat > homebrew-tap/Formula/alwaysrunning.rb << EOF
+          class ResearchMaster < Formula
+            desc "MCP server for searching and downloading academic papers"
+            homepage "https://github.com/hongkongkiwi/alwaysrunning"
+            version "${VERSION}"
+            license "MIT"
+
+            on_macos do
+              on_intel do
+                url "https://github.com/hongkongkiwi/alwaysrunning/releases/download/v${VERSION}/alwaysrunning-v${VERSION}-x86_64-apple-darwin.tar.gz"
+                sha256 "${SHA256_X86_64_DARWIN}"
+              end
+
+              on_arm do
+                url "https://github.com/hongkongkiwi/alwaysrunning/releases/download/v${VERSION}/alwaysrunning-v${VERSION}-aarch64-apple-darwin.tar.gz"
+                sha256 "${SHA256_AARCH64_DARWIN}"
+              end
+            end
+
+            on_linux do
+              on_x86_64 do
+                url "https://github.com/hongkongkiwi/alwaysrunning/releases/download/v${VERSION}/alwaysrunning-v${VERSION}-x86_64-unknown-linux-gnu.tar.gz"
+                sha256 "${SHA256_X86_64_LINUX}"
+              end
+
+              on_arm do
+                url "https://github.com/hongkongkiwi/alwaysrunning/releases/download/v${VERSION}/alwaysrunning-v${VERSION}-aarch64-unknown-linux-gnu.tar.gz"
+                sha256 "${SHA256_AARCH64_LINUX}"
+              end
+            end
+
+            def install
+              bin.install "alwaysrunning"
+              if (buildpath/"alwaysrunning.example.toml").exist?
+                etc.install "alwaysrunning.example.toml"
+              end
+            end
+
+            def caveats
+              <<~EOS
+                Configuration file path:
+                  #{etc}/alwaysrunning/alwaysrunning.toml
+
+                To use with Claude Desktop, add to your MCP config:
+                  {
+                    "mcpServers": {
+                      "alwaysrunning": {
+                        "command": "#{bin}/alwaysrunning",
+                        "args": ["mcp"]
+                      }
+                    }
+                  }
+              EOS
+            end
+
+            test do
+              assert_match version.to_s, shell_output("#{bin}/alwaysrunning --version").strip
+            end
+          end
+          EOF
+
+          cat homebrew-tap/Formula/alwaysrunning.rb
+
+      - name: Commit and push changes
+        working-directory: ./homebrew-tap
+        run: |
+          VERSION_RAW='${{ github.event.inputs.version || github.ref_name }}'
+          VERSION="${VERSION_RAW#v}"
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add Formula/alwaysrunning.rb
+          git commit -m "Update alwaysrunning to v${VERSION}"
+          git push

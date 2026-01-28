@@ -185,6 +185,32 @@ Runner stores state in your home directory:
 - It is not a multi-VM orchestrator. To scale horizontally, bake this into your image or
   cloud-init and use your VM autoscaler.
 
+## Using in another Docker project
+
+Embed `runner` in your multi-stage build:
+
+```dockerfile
+# Build stage
+FROM rust:1-alpine AS runner-builder
+
+WORKDIR /build
+COPY Cargo.toml ./
+COPY src ./src
+RUN cargo build --release --target x86_64-unknown-linux-musl
+
+# Runtime stage
+FROM alpine:3.19
+
+# Copy runner binary
+COPY --from=runner-builder /build/target/x86_64-unknown-linux-musl/release/runner /usr/local/bin/runner
+
+# Copy your app binary and set as entrypoint
+COPY ./my-app-binary /usr/local/bin/
+ENTRYPOINT ["/usr/local/bin/runner", "run", "my-app", "/usr/local/bin/my-app-binary"]
+```
+
+This allows you to keep your long-running app alive inside a container without needing a full init system.
+
 ## Contributing
 
 PRs welcome. Keep it simple and low‑dependency. Run tests with:
