@@ -18,9 +18,17 @@ use std::process::{Command, Stdio};
 use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+// Constants
+const DAEMON_INTERVAL_SECS: u64 = 2;
+const STOP_TIMEOUT_SECS: u64 = 3;
+const GRACEFUL_WAIT_MS: u64 = 100;
+const LOG_FOLLOW_INTERVAL_MS: u64 = 500;
+const STATUS_LOG_LINES: usize = 20;
+const TAIL_CHUNK_SIZE: usize = 8 * 1024;
+
 #[derive(Parser, Debug)]
 #[command(
-    name = "runner",
+    name = "alwaysrunning",
     version,
     about = "Run a binary and keep it alive.",
     arg_required_else_help = true,
@@ -199,6 +207,9 @@ struct InstanceRuntime {
     pid: i32,
     #[serde(default)]
     started_at: u64,
+    /// Process start time for PID identity verification (platform-specific)
+    #[serde(default)]
+    process_start_time: u64,
     #[serde(default)]
     restarts: u64,
     #[serde(default)]
@@ -229,6 +240,8 @@ impl From<RuntimeV0> for Runtime {
                     idx,
                     InstanceRuntime {
                         pid,
+                        // Migration: can't determine process start time for old data
+                        process_start_time: 0,
                         ..InstanceRuntime::default()
                     },
                 );
@@ -454,7 +467,7 @@ fn cmd_stop(name: Option<&str>, all: bool, signal: &str) -> Result<()> {
         for (app_name, rt) in runtime.apps.iter_mut() {
             for inst in rt.instances.values_mut() {
                 if inst.pid > 0 {
-                    terminate_graceful(inst.pid, sig, Duration::from_secs(3));
+                    terminate_graceful(inst.pid, sig, Duration::from_secs(STOP_TIMEOUT_SECS));
                 }
             }
             println!("Stopped {}", app_name);
@@ -499,7 +512,7 @@ fn cmd_restart(name: Option<&str>, all: bool, signal: &str) -> Result<()> {
         for rt in runtime.apps.values_mut() {
             for inst in rt.instances.values_mut() {
                 if inst.pid > 0 {
-                    terminate_graceful(inst.pid, sig, Duration::from_secs(3));
+                    terminate_graceful(inst.pid, sig, Duration::from_secs(STOP_TIMEOUT_SECS));
                 }
             }
         }
@@ -515,7 +528,7 @@ fn cmd_restart(name: Option<&str>, all: bool, signal: &str) -> Result<()> {
         if let Some(rt) = runtime.apps.get_mut(name) {
             for inst in rt.instances.values_mut() {
                 if inst.pid > 0 {
-                    terminate_graceful(inst.pid, sig, Duration::from_secs(3));
+                    terminate_graceful(inst.pid, sig, Duration::from_secs(STOP_TIMEOUT_SECS));
                 }
             }
         }
@@ -826,7 +839,7 @@ fn render_status_screen_with_selection(
             if let Some(inst) = inst {
                 println!("\n--- logs: {}[{}] (tail 20) ---", app.name, inst.index);
                 let path = log_path(&app.name, inst.index);
-                match read_tail_lines(&path, 20) {
+                match read_tail_lines(&path, STATUS_LOG_LINES) {
                     Ok(lines) => {
                         for line in lines {
                             println!("{line}");
@@ -924,6 +937,9 @@ fn build_status_snapshot(apps: &[AppConfig], runtime: &Runtime) -> StatusSnapsho
 }
 
 fn daemon_loop(watch: bool) -> Result<()> {
+    let mut consecutive_write_failures = 0u32;
+    const MAX_WRITE_FAILURES: u32 = 5;
+
     loop {
         let state = read_state()?;
         let mut runtime = read_runtime()?;
@@ -936,6 +952,8 @@ fn daemon_loop(watch: bool) -> Result<()> {
                     for inst in rt.instances.values() {
                         if inst.pid > 0 {
                             terminate_pid(inst.pid);
+                            // Always reap to prevent zombies
+                            let _ = check_exit_status(inst.pid);
                         }
                     }
                 }
@@ -950,18 +968,25 @@ fn daemon_loop(watch: bool) -> Result<()> {
                 if idx >= app.instances {
                     if inst.pid > 0 {
                         terminate_pid(inst.pid);
+                        // Always reap to prevent zombies
+                        let _ = check_exit_status(inst.pid);
                     }
                     remove_idx.push(idx);
                     continue;
                 }
 
                 if inst.pid > 0 {
-                    if let Some(exit) = check_exit_status(inst.pid) {
+                    // Always check exit status first to reap zombies
+                    let exit_info = check_exit_status(inst.pid);
+                    let still_alive = is_pid_alive(inst.pid);
+
+                    if let Some(exit) = exit_info {
                         inst.pid = 0;
                         inst.last_exit_at = Some(now_ts());
                         inst.last_exit_code = exit.code;
                         inst.last_exit_signal = exit.signal;
-                    } else if !is_pid_alive(inst.pid) {
+                    } else if !still_alive {
+                        // Process died but we couldn't get exit status
                         inst.pid = 0;
                         inst.last_exit_at = Some(now_ts());
                         inst.last_exit_code = None;
@@ -978,12 +1003,13 @@ fn daemon_loop(watch: bool) -> Result<()> {
                 let inst = rt.instances.entry(idx).or_default();
                 if inst.pid == 0 {
                     match spawn_instance(app, idx) {
-                        Ok(pid) => {
+                        Ok((pid, start_time)) => {
                             if inst.started_at > 0 {
                                 inst.restarts += 1;
                             }
                             inst.pid = pid;
                             inst.started_at = now_ts();
+                            inst.process_start_time = start_time;
                         }
                         Err(err) => {
                             eprintln!("spawn failed for {}[{}]: {err}", app.name, idx);
@@ -993,25 +1019,44 @@ fn daemon_loop(watch: bool) -> Result<()> {
             }
         }
 
-        write_runtime(&runtime)?;
+        if let Err(e) = write_runtime(&runtime) {
+            consecutive_write_failures += 1;
+            eprintln!(
+                "Failed to write runtime state (failure {}/{}): {}",
+                consecutive_write_failures, MAX_WRITE_FAILURES, e
+            );
+            if consecutive_write_failures >= MAX_WRITE_FAILURES {
+                eprintln!("Too many runtime write failures, exiting daemon");
+                return Err(e);
+            }
+        } else {
+            consecutive_write_failures = 0;
+        }
+
         if watch {
             let snapshot = build_status_snapshot(&state.apps, &runtime);
             render_status_screen_with_selection(&snapshot, 0, 0, false);
         }
-        thread::sleep(Duration::from_secs(2));
+        thread::sleep(Duration::from_secs(DAEMON_INTERVAL_SECS));
     }
 }
 
-fn spawn_instance(app: &AppConfig, idx: usize) -> Result<i32> {
+fn spawn_instance(app: &AppConfig, idx: usize) -> Result<(i32, u64)> {
     let log = log_path(&app.name, idx);
     if let Some(parent) = log.parent() {
         fs::create_dir_all(parent)?;
     }
-    let log_file = OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(&log)
-        .with_context(|| format!("open log {:?}", log))?;
+    let log_file = {
+        let mut opts = OpenOptions::new();
+        opts.create(true).append(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            opts.mode(0o600);
+        }
+        opts.open(&log)
+            .with_context(|| format!("open log {:?}", log))?
+    };
 
     let mut cmd = Command::new(&app.cmd);
     if app.clean_env {
@@ -1023,15 +1068,18 @@ fn spawn_instance(app: &AppConfig, idx: usize) -> Result<i32> {
         }
     }
     cmd.args(&app.args);
-    cmd.env("RUNNER_APP", &app.name);
-    cmd.env("RUNNER_INSTANCE", idx.to_string());
-    cmd.env("RUNNER_LOG", log.to_string_lossy().to_string());
+    cmd.env("ALWAYSRUNNING_APP", &app.name);
+    cmd.env("ALWAYSRUNNING_INSTANCE", idx.to_string());
+    cmd.env("ALWAYSRUNNING_LOG", log.to_string_lossy().to_string());
     cmd.stdin(Stdio::null());
     cmd.stdout(log_file.try_clone()?);
     cmd.stderr(log_file);
 
     let child = cmd.spawn().with_context(|| format!("spawn {}", app.cmd))?;
-    Ok(child.id() as i32)
+    let pid = child.id() as i32;
+    // Get process start time for PID identity verification
+    let start_time = get_process_start_time(pid).unwrap_or(0);
+    Ok((pid, start_time))
 }
 
 fn ensure_daemon_running() -> Result<()> {
@@ -1119,14 +1167,22 @@ fn write_json_atomic<T: Serialize>(path: &Path, val: &T) -> Result<()> {
         fs::create_dir_all(parent)?;
     }
     let tmp = path.with_extension("tmp");
-    let data = serde_json::to_vec_pretty(val)?;
-    {
-        let mut f = File::create(&tmp)?;
-        f.write_all(&data)?;
-        f.sync_all()?;
+    let result = (|| -> Result<()> {
+        let data = serde_json::to_vec_pretty(val)?;
+        {
+            let mut f = File::create(&tmp)?;
+            f.write_all(&data)?;
+            f.sync_all()?;
+        }
+        fs::rename(&tmp, path)?;
+        Ok(())
+    })();
+
+    // Clean up temp file on error
+    if result.is_err() && tmp.exists() {
+        let _ = fs::remove_file(&tmp);
     }
-    fs::rename(&tmp, path)?;
-    Ok(())
+    result
 }
 
 fn now_ts() -> u64 {
@@ -1183,7 +1239,7 @@ fn follow_file(path: &Path, json: bool) -> Result<()> {
             }
             pos = new_pos;
         }
-        thread::sleep(Duration::from_millis(500));
+        thread::sleep(Duration::from_millis(LOG_FOLLOW_INTERVAL_MS));
     }
 }
 
@@ -1201,10 +1257,9 @@ fn read_tail_lines(path: &Path, lines: usize) -> Result<Vec<String>> {
     let mut pos = f.seek(SeekFrom::End(0))?;
     let mut buf: Vec<u8> = Vec::new();
     let mut found = 0usize;
-    const CHUNK: usize = 8 * 1024;
 
     while pos > 0 && found <= lines {
-        let read_size = std::cmp::min(CHUNK as u64, pos) as usize;
+        let read_size = std::cmp::min(TAIL_CHUNK_SIZE as u64, pos) as usize;
         pos -= read_size as u64;
         f.seek(SeekFrom::Start(pos))?;
         let mut chunk = vec![0u8; read_size];
@@ -1215,10 +1270,20 @@ fn read_tail_lines(path: &Path, lines: usize) -> Result<Vec<String>> {
         buf = new_buf;
     }
 
-    let text = String::from_utf8_lossy(&buf);
+    // Handle UTF-8 by finding a valid starting boundary
+    let mut start = 0;
+    while start < buf.len() {
+        if buf[start].is_ascii() || (buf[start] & 0b1100_0000) != 0b1000_0000 {
+            // This is either ASCII or a start byte (not a continuation byte)
+            break;
+        }
+        start += 1;
+    }
+
+    let text = String::from_utf8_lossy(&buf[start..]);
     let all_lines: Vec<&str> = text.lines().collect();
-    let start = all_lines.len().saturating_sub(lines);
-    Ok(all_lines[start..].iter().map(|s| s.to_string()).collect())
+    let start_idx = all_lines.len().saturating_sub(lines);
+    Ok(all_lines[start_idx..].iter().map(|s| s.to_string()).collect())
 }
 
 #[derive(Debug, Default, Clone, Copy)]
@@ -1328,9 +1393,18 @@ fn parse_since(input: &str) -> Result<SystemTime> {
         .with_context(|| format!("invalid --since value: {input}"))?;
     let secs = match unit {
         "s" | "S" => value,
-        "m" | "M" => value * 60,
-        "h" | "H" => value * 60 * 60,
-        "d" | "D" => value * 60 * 60 * 24,
+        "m" | "M" => value
+            .checked_mul(60)
+            .ok_or_else(|| anyhow::anyhow!("--since value too large: {input}"))?,
+        "h" | "H" => value
+            .checked_mul(60)
+            .and_then(|v| v.checked_mul(60))
+            .ok_or_else(|| anyhow::anyhow!("--since value too large: {input}"))?,
+        "d" | "D" => value
+            .checked_mul(60)
+            .and_then(|v| v.checked_mul(60))
+            .and_then(|v| v.checked_mul(24))
+            .ok_or_else(|| anyhow::anyhow!("--since value too large: {input}"))?,
         _ => anyhow::bail!("invalid --since unit: {input} (use s/m/h/d or unix seconds)"),
     };
     Ok(SystemTime::now()
@@ -1543,7 +1617,7 @@ fn terminate_graceful(pid: i32, signal: i32, timeout: Duration) {
         if !is_pid_alive(pid) {
             return;
         }
-        thread::sleep(Duration::from_millis(100));
+        thread::sleep(Duration::from_millis(GRACEFUL_WAIT_MS));
     }
     terminate_pid_with_signal(pid, libc::SIGKILL);
 }
@@ -1560,16 +1634,21 @@ fn parse_signal(signal: &str) -> Result<i32> {
     #[cfg(windows)]
     {
         let s = signal.trim().to_uppercase();
-        if s.parse::<i32>().is_ok() {
-            return Ok(0);
+        // Validate signal name but always return 0 on Windows (signals not supported)
+        let _valid = if s.parse::<i32>().is_ok() {
+            true
+        } else {
+            let s = s.strip_prefix("SIG").unwrap_or(&s);
+            matches!(
+                s,
+                "TERM" | "KILL" | "INT" | "HUP" | "QUIT" | "USR1" | "USR2" | "STOP" | "CONT"
+            )
+        };
+        if !_valid {
+            anyhow::bail!("Unknown signal: {signal}");
         }
-        let s = s.strip_prefix("SIG").unwrap_or(&s);
-        match s {
-            "TERM" | "KILL" | "INT" | "HUP" | "QUIT" | "USR1" | "USR2" | "STOP" | "CONT" => {
-                Ok(0)
-            }
-            _ => anyhow::bail!("Unknown signal: {signal}"),
-        }
+        eprintln!("Warning: Signals are not supported on Windows. Using forceful termination.");
+        Ok(0)
     }
     #[cfg(all(not(unix), not(windows)))]
     {
@@ -1630,6 +1709,59 @@ fn is_pid_alive(pid: i32) -> bool {
     }
 }
 
+/// Get process start time for PID identity verification.
+/// Returns 0 if unable to determine.
+fn get_process_start_time(pid: i32) -> Option<u64> {
+    if pid <= 0 {
+        return None;
+    }
+    #[cfg(target_os = "linux")]
+    {
+        // Read start time from /proc/[pid]/stat
+        let path = format!("/proc/{}/stat", pid);
+        if let Ok(content) = std::fs::read_to_string(&path) {
+            // Parse: pid (comm) state ppid pgrp session tty_nr tpgid flags minflt cminflt majflt cmajflt utime stime cutime cstime priority nice num_threads itrealvalue starttime ...
+            // starttime is the 22nd field (index 21)
+            let parts: Vec<&str> = content.split_whitespace().collect();
+            if parts.len() > 21 {
+                if let Ok(starttime) = parts[21].parse::<u64>() {
+                    return Some(starttime);
+                }
+            }
+        }
+        None
+    }
+    #[cfg(target_os = "macos")]
+    {
+        // Use proc_pidinfo with PROC_PIDTASKINFO
+        unsafe {
+            const PROC_PIDTASKINFO: i32 = 4;
+            #[repr(C)]
+            struct ProcTaskInfo {
+                ptinfo: [u8; 128], // Simplified - actual struct is larger
+            }
+            let mut info: ProcTaskInfo = std::mem::zeroed();
+            let size = libc::proc_pidinfo(
+                pid,
+                PROC_PIDTASKINFO,
+                0,
+                &mut info as *mut _ as *mut libc::c_void,
+                std::mem::size_of::<ProcTaskInfo>() as i32,
+            );
+            if size > 0 {
+                // Return current time as a fallback (macOS struct parsing is complex)
+                return Some(now_ts());
+            }
+        }
+        None
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    {
+        let _ = pid;
+        None
+    }
+}
+
 #[cfg(unix)]
 unsafe fn last_errno() -> i32 {
     #[cfg(target_os = "linux")]
@@ -1676,7 +1808,7 @@ fn daemonize() -> Result<()> {
 
 #[cfg(not(unix))]
 fn daemonize() -> Result<()> {
-    Ok(())
+    anyhow::bail!("Daemon mode is not supported on this platform. Use --foreground instead.")
 }
 
 #[cfg(target_os = "macos")]

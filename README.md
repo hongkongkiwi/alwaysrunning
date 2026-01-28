@@ -30,7 +30,7 @@ Supported OS: macOS, Linux, Windows. Autostart setup is currently macOS/Linux on
 cargo build --release
 ```
 
-Binary path: `target/release/runner`
+Binary path: `target/release/alwaysrunning`
 
 ## Quickstart
 
@@ -202,11 +202,11 @@ RUN cargo build --release --target x86_64-unknown-linux-musl
 FROM alpine:3.19
 
 # Copy runner binary
-COPY --from=runner-builder /build/target/x86_64-unknown-linux-musl/release/runner /usr/local/bin/runner
+COPY --from=runner-builder /build/target/x86_64-unknown-linux-musl/release/alwaysrunning /usr/local/bin/alwaysrunning
 
 # Copy your app binary and set as entrypoint
 COPY ./my-app-binary /usr/local/bin/
-ENTRYPOINT ["/usr/local/bin/runner", "run", "my-app", "/usr/local/bin/my-app-binary"]
+ENTRYPOINT ["/usr/local/bin/alwaysrunning", "run", "my-app", "/usr/local/bin/my-app-binary"]
 ```
 
 This allows you to keep your long-running app alive inside a container without needing a full init system.
