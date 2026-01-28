@@ -394,15 +394,14 @@ jobs:
           Name:           ${pkgname}
           Version:        ${VERSION}
           Release:        0%{?dist}
-          Summary:        Model Context Protocol server for academic research sources
+          Summary:        A tiny process supervisor for long-running binaries
           License:        MIT
           URL:            https://github.com/hongkongkiwi/alwaysrunning
           Source0:        %{name}-%{version}.tar.gz
           BuildArch:      ${{ matrix.rpm_arch }}
           %description
-          Model Context Protocol server that provides unified access to 26+ academic
-          research sources (arXiv, Semantic Scholar, PubMed, OpenAlex, etc.) for
-          searching, downloading, and analyzing academic papers.
+          A tiny process supervisor that keeps your binary alive, restarts it if it dies,
+          and writes logs to ~/.alwaysrunning. No YAML. No unit files. No Kubernetes.
 
           %prep
           %setup -q
@@ -493,7 +492,7 @@ jobs:
           pkgname=alwaysrunning
           pkgver=VERSION_PLACEHOLDER
           pkgrel=0
-          pkgdesc="Model Context Protocol server for academic research sources"
+          pkgdesc="A tiny process supervisor for long-running binaries"
           url="https://github.com/hongkongkiwi/alwaysrunning"
           arch="${{ matrix.apk_arch }}"
           license="MIT"

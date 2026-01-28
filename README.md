@@ -35,18 +35,18 @@ Binary path: `target/release/runner`
 ## Quickstart
 
 ```bash
-./target/release/runner run myapp ./my-binary --instances 3
-./target/release/runner status
-./target/release/runner status --watch
-./target/release/runner status --json
-./target/release/runner logs myapp --follow
-./target/release/runner logs myapp --lines 500
-./target/release/runner logs myapp --since 10m
-./target/release/runner logs myapp --json
-./target/release/runner stop myapp
-./target/release/runner start myapp
-./target/release/runner restart myapp
-./target/release/runner delete myapp
+./target/release/alwaysrunning run myapp ./my-binary --instances 3
+./target/release/alwaysrunning status
+./target/release/alwaysrunning status --watch
+./target/release/alwaysrunning status --json
+./target/release/alwaysrunning logs myapp --follow
+./target/release/alwaysrunning logs myapp --lines 500
+./target/release/alwaysrunning logs myapp --since 10m
+./target/release/alwaysrunning logs myapp --json
+./target/release/alwaysrunning stop myapp
+./target/release/alwaysrunning start myapp
+./target/release/alwaysrunning restart myapp
+./target/release/alwaysrunning delete myapp
 ```
 
 Notes:
@@ -58,8 +58,8 @@ Notes:
 Load environment variables from a file:
 
 ```bash
-./target/release/runner run myapp ./my-binary --env-file .env
-./target/release/runner run myapp ./my-binary --env-file .env --clean-env
+./target/release/alwaysrunning run myapp ./my-binary --env-file .env
+./target/release/alwaysrunning run myapp ./my-binary --env-file .env --clean-env
 ```
 
 Env file format: simple `KEY=VALUE` lines, optional `export` prefix, `#` comments, and optional quotes.
@@ -68,7 +68,7 @@ Note: runner flags must come before the binary args. Use `--` if your binary has
 would conflict with runner or to force everything after it to be passed through:
 
 ```bash
-./target/release/runner run myapp ./my-binary --env-file .env -- --binary-flag foo
+./target/release/alwaysrunning run myapp ./my-binary --env-file .env -- --binary-flag foo
 ```
 
 ## Foreground / attach
@@ -76,13 +76,13 @@ would conflict with runner or to force everything after it to be passed through:
 Foreground mode (live screen in current terminal):
 
 ```bash
-./target/release/runner run myapp ./my-binary --instances 3 --foreground
+./target/release/alwaysrunning run myapp ./my-binary --instances 3 --foreground
 ```
 
 Attach to a running instance from another terminal:
 
 ```bash
-./target/release/runner attach
+./target/release/alwaysrunning attach
 ```
 
 Watch screen controls: `q`/Ctrl+C to quit, `r` to restart, `s` to stop,
@@ -93,8 +93,8 @@ Watch screen controls: `q`/Ctrl+C to quit, `r` to restart, `s` to stop,
 Export/import config:
 
 ```bash
-./target/release/runner export runner.json
-./target/release/runner import runner.json --start
+./target/release/alwaysrunning export runner.json
+./target/release/alwaysrunning import runner.json --start
 ```
 
 ## Autostart (boot)
@@ -102,20 +102,20 @@ Export/import config:
 `runner` can install autostart on macOS (launchd) and Linux (systemd user).
 
 ```bash
-./target/release/runner install
+./target/release/alwaysrunning install
 ```
 
 This writes a minimal, hidden OS-native config and enables it for you.
 You don't have to hand-edit anything. Remove it with:
 
 ```bash
-./target/release/runner uninstall
+./target/release/alwaysrunning uninstall
 ```
 
 If you'd prefer to skip autostart:
 
 ```bash
-./target/release/runner run myapp ./my-binary --instances 3 --no-autostart
+./target/release/alwaysrunning run myapp ./my-binary --instances 3 --no-autostart
 ```
 
 ## Logs
@@ -135,14 +135,14 @@ Filters:
 Human‑readable:
 
 ```bash
-runner status
-runner status --watch
+./target/release/alwaysrunning status
+./target/release/alwaysrunning status --watch
 ```
 
 JSON (useful for scripts):
 
 ```bash
-runner status --json
+./target/release/alwaysrunning status --json
 ```
 
 ## Signals
@@ -150,8 +150,8 @@ runner status --json
 Send a different signal when stopping/restarting:
 
 ```bash
-runner stop myapp --signal KILL
-runner restart myapp --signal HUP
+./target/release/alwaysrunning stop myapp --signal KILL
+./target/release/alwaysrunning restart myapp --signal HUP
 ```
 
 On Windows, signals are accepted but behave as a forceful terminate.
