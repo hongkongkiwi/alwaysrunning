@@ -2,9 +2,14 @@
 name = "alwaysrunning"
 version = "0.1.2"
 edition = "2024"
+description = "A tiny process supervisor for long-running binaries. No YAML. No unit files. No Kubernetes."
+repository = "https://github.com/hongkongkiwi/alwaysrunning"
+license = "MIT"
+keywords = ["cli", "supervisor", "process-manager", "daemon"]
+categories = ["command-line-utilities", "os::unix-apis", "system-administration"]
 
 [[bin]]
-name = "runner"
+name = "alwaysrunning"
 path = "src/main.rs"
 
 [dependencies]
